@@ -14,6 +14,7 @@ import {
 	initializeGpuRenderer,
 	isGpuAvailable,
 } from "@/services/renderer/gpu-renderer";
+import { installAgentBridge } from "@/agent-bridge";
 
 interface EditorProviderProps {
 	projectId: string;
@@ -44,6 +45,9 @@ export function EditorProvider({ projectId, children }: EditorProviderProps) {
 
 				if (cancelled) return;
 
+				if (process.env.NODE_ENV === "development") {
+					installAgentBridge();
+				}
 				setIsLoading(false);
 				loadFontAtlas();
 			} catch (err) {
