@@ -5,11 +5,34 @@
 import { createInterface } from "node:readline";
 import { spawn, execFile } from "node:child_process";
 import { existsSync, openSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
-import { dirname, extname, resolve } from "node:path";
+import { mkdir, writeFile } from "node:fs/promises";
+import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { launch } from "./opencut.mjs";
 import { contactSheet, convertGif, cutSilences, probe } from "./ffmpeg.mjs";
+import {
+	configPath,
+	loadConfig,
+	saveConfig,
+	SETTING_DESCRIPTIONS,
+	workDir,
+} from "./config.mjs";
+import {
+	findTranscript,
+	findWords,
+	loadWords,
+	resolveEngine,
+	transcribe,
+	wordsToCues,
+} from "./transcribe.mjs";
+import {
+	listArtifacts,
+	artifactUrl,
+	publishArtifact,
+	unpublishArtifact,
+	writeSession,
+} from "./artifacts.mjs";
+import { isServing, startServer } from "./serve.mjs";
 
 const AGENT_DIR = dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = resolve(AGENT_DIR, "../apps/web");
@@ -65,10 +88,36 @@ function stopDevServer() {
 	}
 }
 
+// -------------------------------------------------------------- media server
+
+let mediaServer = null;
+
+/** Starts the media server in-process unless one already answers the port. */
+async function ensureMediaServer(port = loadConfig().server_port) {
+	if (!port) return null;
+	if (mediaServer?.port === port) return mediaServer.url;
+	if (await isServing(port)) return `http://localhost:${port}`;
+	mediaServer?.close();
+	mediaServer = await startServer({ port });
+	log("media server on", mediaServer.url);
+	return mediaServer.url;
+}
+
+function publish(path, options) {
+	const artifact = publishArtifact(path, options);
+	return { id: artifact.id, url: artifact.url, path: artifact.path };
+}
+
 // ------------------------------------------------------------------- session
 
 let session = null;
 let sessionHeaded = false;
+
+async function recordSession(editor) {
+	const state = await editor.getState();
+	writeSession({ project_id: state.projectId, headed: sessionHeaded, editor_base: BASE_URL });
+	return state;
+}
 
 async function getSession({ headed, projectId } = {}) {
 	if (session && headed !== undefined && headed !== sessionHeaded) {
@@ -155,7 +204,10 @@ async function importPaths(editor, paths, { minDuration } = {}) {
 		const path = resolve(raw);
 		if (!existsSync(path)) throw new Error(`File not found: ${path}`);
 		if (extname(path).toLowerCase() === ".gif") {
-			const converted = await convertGif(path, { minDuration });
+			const converted = await convertGif(path, {
+				minDuration,
+				outputDir: workDir("converted"),
+			});
 			notes.push(`${path} -> ${converted} (GIFs are converted to video)`);
 			prepared.push(converted);
 		} else {
@@ -275,9 +327,12 @@ const tools = [
 		async handler({ project_id, name, headed }) {
 			const editor = await getSession({ headed, projectId: project_id });
 			if (name) await editor.renameProject({ name });
-			const state = await editor.getState();
+			const state = await recordSession(editor);
+			const server = await ensureMediaServer().catch(() => null);
 			return text({
 				project_id: state.projectId,
+				editor_url: `${BASE_URL}/editor/${state.projectId}`,
+				media_server: server,
 				canvas: state.canvasSize,
 				fps: state.fps,
 				duration: state.duration,
@@ -298,7 +353,7 @@ const tools = [
 			await editor.save().catch(() => {});
 			await editor.openProject();
 			if (name) await editor.renameProject({ name });
-			const state = await editor.getState();
+			const state = await recordSession(editor);
 			return text({ project_id: state.projectId, canvas: state.canvasSize });
 		},
 	},
@@ -842,19 +897,25 @@ const tools = [
 			properties: {
 				times: { type: "array", items: { type: "number" }, description: "Timeline seconds (max 6)" },
 				width: num("Image width, default 640"),
+				publish: bool("Also save the frames and host them on the media server"),
 			},
 			required: ["times"],
 		},
-		async handler({ times, width = 640 }) {
+		async handler({ times, width = 640, publish: shouldPublish = false }) {
 			const editor = await getSession();
 			const content = [];
+			const projectId = shouldPublish ? (await editor.getState()).projectId.slice(0, 8) : null;
 			for (const time of times.slice(0, 6)) {
-				content.push({ type: "text", text: `t=${time}s` });
-				content.push({
-					type: "image",
-					mimeType: "image/jpeg",
-					data: await editor.renderFrame({ time, width }),
-				});
+				const data = await editor.renderFrame({ time, width });
+				let label = `t=${time}s`;
+				if (shouldPublish) {
+					const file = join(workDir("previews"), `${projectId}-t${time}.jpg`);
+					await writeFile(file, Buffer.from(data, "base64"));
+					await ensureMediaServer().catch(() => null);
+					label += ` ${publish(file, { title: `Preview ${time}s` }).url}`;
+				}
+				content.push({ type: "text", text: label });
+				content.push({ type: "image", mimeType: "image/jpeg", data });
 			}
 			return { content };
 		},
@@ -862,30 +923,47 @@ const tools = [
 	{
 		name: "export_video",
 		description:
-			"Render the project to a video file on disk. Returns path, size, duration, and (by default) a contact sheet image of evenly spaced frames to check the result.",
+			"Render the project to a video file and publish it on the media server. Returns path, URL, size, duration, and (by default) a contact sheet of evenly spaced frames to check the result.",
 		inputSchema: {
 			type: "object",
 			properties: {
-				path: str("Output file path (.mp4 or .webm)"),
+				path: str("Output path (.mp4 or .webm); default <work folder>/exports/<project>-<time>.mp4"),
+				title: str("Title shown in the media server gallery"),
 				quality: { type: "string", enum: ["low", "medium", "high", "very_high"] },
 				include_audio: bool("Default true"),
 				contact_sheet: bool("Return a frame grid of the result (default true)"),
 			},
-			required: ["path"],
 		},
-		async handler({ path, quality = "high", include_audio = true, contact_sheet = true }) {
+		async handler({ path, title, quality = "high", include_audio = true, contact_sheet = true }) {
 			const editor = await getSession();
-			const format = extname(path).toLowerCase() === ".webm" ? "webm" : "mp4";
-			const result = await editor.exportTo(resolve(path), {
+			const state = await editor.getState();
+			const target = path
+				? resolve(path)
+				: join(
+						workDir("exports"),
+						`${state.projectId.slice(0, 8)}-${new Date().toISOString().replace(/[:.]/g, "-")}.mp4`,
+					);
+			const format = extname(target).toLowerCase() === ".webm" ? "webm" : "mp4";
+			const result = await editor.exportTo(target, {
 				format,
 				quality,
 				includeAudio: include_audio,
 			});
 			const info = await probe(result.path);
+			await ensureMediaServer().catch(() => null);
+			const published = publish(result.path, {
+				title,
+				meta: { project_id: state.projectId, duration: info.duration },
+			});
 			const content = [
 				{
 					type: "text",
-					text: JSON.stringify({ ...result, duration: info.duration, has_audio: info.hasAudio }),
+					text: JSON.stringify({
+						...result,
+						url: published.url,
+						duration: info.duration,
+						has_audio: info.hasAudio,
+					}),
 				},
 			];
 			if (contact_sheet) {
@@ -904,7 +982,7 @@ const tools = [
 			type: "object",
 			properties: {
 				input: str("Source video/audio path"),
-				output: str("Output path (default <input>.nosilence.<ext>)"),
+				output: str("Output path (default <work folder>/cuts/<name>.nosilence.<ext>)"),
 				threshold_db: num("Quieter than this counts as silence, default -35"),
 				min_silence: num("Only cut silences at least this long (s), default 0.5"),
 				padding: num("Seconds of silence kept next to speech, default 0.15"),
@@ -913,15 +991,19 @@ const tools = [
 			required: ["input"],
 		},
 		async handler({ input, output, threshold_db, min_silence, padding, dry_run }) {
-			return text(
-				await cutSilences(input, {
-					output,
-					thresholdDb: threshold_db,
-					minSilence: min_silence,
-					padding,
-					dryRun: dry_run,
-				}),
-			);
+			const stem = basename(input, extname(input));
+			const result = await cutSilences(input, {
+				output: output ?? join(workDir("cuts"), `${stem}.nosilence${extname(input)}`),
+				thresholdDb: threshold_db,
+				minSilence: min_silence,
+				padding,
+				dryRun: dry_run,
+			});
+			if (result.output) {
+				await ensureMediaServer().catch(() => null);
+				result.url = publish(result.output, { title: `${stem} (silences cut)` }).url;
+			}
+			return text(result);
 		},
 	},
 	{
@@ -946,6 +1028,196 @@ const tools = [
 		},
 	},
 	{
+		name: "get_settings",
+		description:
+			"Show persistent settings (work folder, transcript location, transcription engine/model, media server port) and where they are stored. Settings persist across sessions.",
+		inputSchema: { type: "object", properties: {} },
+		async handler() {
+			return text({
+				settings: loadConfig(),
+				descriptions: SETTING_DESCRIPTIONS,
+				stored_at: configPath(),
+				transcription_engine_in_use: await resolveEngine().catch((e) => `error: ${e.message}`),
+			});
+		},
+	},
+	{
+		name: "set_settings",
+		description:
+			"Change persistent settings. work_folder is the flat folder where generated files live (transcripts, converted media, exports); it is reused across sessions.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				work_folder: str(SETTING_DESCRIPTIONS.work_folder),
+				transcript_location: {
+					type: "string",
+					enum: ["work_folder", "next_to_video"],
+					description: SETTING_DESCRIPTIONS.transcript_location,
+				},
+				transcription_engine: {
+					type: "string",
+					enum: ["auto", "faster-whisper", "whisper.cpp"],
+					description: SETTING_DESCRIPTIONS.transcription_engine,
+				},
+				python: str(SETTING_DESCRIPTIONS.python),
+				whisper_model: str(SETTING_DESCRIPTIONS.whisper_model),
+				language: str(SETTING_DESCRIPTIONS.language),
+				keep_fillers: bool(SETTING_DESCRIPTIONS.keep_fillers),
+				server_port: num(SETTING_DESCRIPTIONS.server_port),
+			},
+		},
+		async handler(args) {
+			const settings = saveConfig(args);
+			if (args.server_port !== undefined) await ensureMediaServer(settings.server_port);
+			return text({ settings, stored_at: configPath() });
+		},
+	},
+	{
+		name: "transcribe_video",
+		description:
+			"Generate subtitles (.vtt) and word timings for a video/audio file. Reuses an existing transcript (next to the file or in the work folder) unless force=true. Files are named deterministically: <name>.vtt beside the video, or <name>.<fingerprint>.vtt in <work folder>/transcripts.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				path: str("Video or audio file"),
+				force: bool("Re-transcribe even if a transcript exists"),
+				location: {
+					type: "string",
+					enum: ["work_folder", "next_to_video"],
+					description: "Where to write; default from settings",
+				},
+				model: str("Override the model for this run"),
+				language: str("Override the language for this run"),
+			},
+			required: ["path"],
+		},
+		async handler({ path, force, location, model, language }) {
+			const result = await transcribe(path, { force, location, model, language });
+			if (result.vtt) {
+				await ensureMediaServer().catch(() => null);
+				result.url = publish(result.vtt, { title: `${basename(path)} subtitles` }).url;
+			}
+			return text(result);
+		},
+	},
+	{
+		name: "find_words",
+		description:
+			"Find when words or phrases are spoken in a video. Uses the existing transcript, transcribing first if there is none. Matching ignores case and punctuation. Returns start/end seconds (in the source file) and surrounding words for each occurrence.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				path: str("Video or audio file"),
+				phrases: {
+					type: "array",
+					items: { type: "string" },
+					description: 'Words or phrases, e.g. ["sound effect", "thanks for watching"]',
+				},
+				context: num("Words of context on each side (default 6)"),
+			},
+			required: ["path", "phrases"],
+		},
+		async handler({ path, phrases, context }) {
+			return text(await findWords(path, phrases, { context }));
+		},
+	},
+	{
+		name: "get_transcript",
+		description:
+			"Read what is said in a video, with timestamps, optionally only within start..end seconds. Transcribes first if needed. format=cues gives subtitle lines; words gives each word.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				path: str("Video or audio file"),
+				start: num("From this many seconds"),
+				end: num("Up to this many seconds"),
+				format: { type: "string", enum: ["cues", "words"] },
+			},
+			required: ["path"],
+		},
+		async handler({ path, start = 0, end = Infinity, format = "cues" }) {
+			let transcript = await findTranscript(path);
+			if (!transcript) transcript = await transcribe(path);
+			const { precision, words, cues } = await loadWords(transcript);
+			const inRange = (item) => item.end > start && item.start < end;
+			const items =
+				format === "words"
+					? words.filter(inRange)
+					: (cues ?? wordsToCues(words)).filter(inRange);
+			return text({
+				transcript: transcript.vtt ?? transcript.words,
+				precision,
+				[format]: items.map((item) => ({
+					start: item.start,
+					end: item.end,
+					...(format === "words" ? { word: item.word, prob: item.prob } : { text: item.text }),
+				})),
+			});
+		},
+	},
+	{
+		name: "media_server",
+		description:
+			"Start (if needed) the local media server and return its URLs: a gallery page, a JSON list of published results, a live update stream (SSE), and a redirect to the OpenCut editor for the current project. Use these URLs to show results in another UI.",
+		inputSchema: {
+			type: "object",
+			properties: { port: num("Use this port (also saved as the default)") },
+		},
+		async handler({ port }) {
+			if (port !== undefined) saveConfig({ server_port: port });
+			const url = await ensureMediaServer(port ?? (loadConfig().server_port || 8787));
+			return text({
+				gallery: `${url}/`,
+				artifacts_api: `${url}/api/artifacts`,
+				status_api: `${url}/api/status`,
+				events_sse: `${url}/events`,
+				editor: `${url}/editor`,
+				published: listArtifacts().length,
+				running_in: mediaServer?.url === url ? "this MCP server" : "another process",
+			});
+		},
+	},
+	{
+		name: "publish_file",
+		description:
+			"Host any local file on the media server (video, image, audio, VTT, JSON, HTML...) and get a URL. Republishing the same path keeps the same URL.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				path: str("Local file"),
+				title: str("Title for the gallery"),
+			},
+			required: ["path"],
+		},
+		async handler({ path, title }) {
+			await ensureMediaServer().catch(() => null);
+			return text(publish(path, { title }));
+		},
+	},
+	{
+		name: "list_published",
+		description: "List files hosted on the media server, newest first, with URLs.",
+		inputSchema: { type: "object", properties: {} },
+		async handler() {
+			return text(
+				listArtifacts().map((a) => ({ id: a.id, title: a.title, kind: a.kind, url: artifactUrl(a), path: a.path })),
+			);
+		},
+	},
+	{
+		name: "unpublish",
+		description: "Stop hosting a published file (the file itself is kept).",
+		inputSchema: {
+			type: "object",
+			properties: { id: str("Artifact id from list_published") },
+			required: ["id"],
+		},
+		async handler({ id }) {
+			unpublishArtifact(id);
+			return text("unpublished");
+		},
+	},
+	{
 		name: "close_editor",
 		description: "Save and close the browser (the dev server keeps running).",
 		inputSchema: { type: "object", properties: {} },
@@ -960,7 +1232,9 @@ const INSTRUCTIONS = `OpenCut video editor tools. All times are in seconds.
 Workflow: open_project -> (optional cut_silences on raw footage) -> add_clip / add_text / add_sound_effect -> trim_clip, set_properties, zoom, fade, animate -> preview_frames to check -> export_video.
 Timeline: overlay tracks sit above the main video track; track index 0 is the top layer. Tracks with no clips are removed automatically, so create tracks by placing a clip with track="new".
 Positions (x, y) are canvas pixels offset from the center; get_timeline shows the canvas size. Volume is in dB (0 = original).
-Keyframe times are timeline times and must fall inside the clip.`;
+Keyframe times are timeline times and must fall inside the clip.
+Transcripts: transcribe_video / find_words / get_transcript work on source files (times are in the source, not the timeline). find_words is the fast way to locate where something is said; feed its times into source_in/source_out or split points.
+Results: export_video, cut_silences and transcribe_video publish their output on the local media server (see media_server for URLs); publish_file hosts anything else. Generated files live in the work folder (get_settings / set_settings).`;
 
 // ----------------------------------------------------------------- transport
 
@@ -1047,6 +1321,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 
 async function shutdown() {
 	await closeSession();
+	mediaServer?.close();
 	stopDevServer();
 	process.exit(0);
 }

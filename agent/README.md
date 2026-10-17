@@ -41,10 +41,54 @@ a different address. Projects and media persist in `agent/out/browser-profile`.
 | `export_video` | Render to .mp4/.webm, returns a contact sheet of the result |
 | `cut_silences` | ffmpeg: remove silent stretches from raw footage |
 | `contact_sheet` | Frame grid of any video |
+| `transcribe_video` | Subtitles (.vtt) + word timings for a file; reuses existing transcripts |
+| `find_words` | When words/phrases are spoken (transcribes first if needed) |
+| `get_transcript` | What is said, with times, optionally within a range |
+| `get_settings`, `set_settings` | Persistent settings (work folder, engine, model, port) |
+| `media_server`, `publish_file`, `list_published`, `unpublish` | Host results over HTTP |
 | `close_editor` | Save and close the browser |
 
 Units: seconds everywhere; `x`/`y` are canvas pixels from the center; volume
-in dB (0 = original, -60..20).
+in dB (0 = original, -60..20). Transcript times are in the source file.
+
+## Settings and the work folder
+
+Settings persist per user in `%APPDATA%/opencut-agent/config.json`
+(`OPENCUT_AGENT_CONFIG` overrides the path). Generated files go in a flat work
+folder (default `~/opencut-work`): `transcripts/`, `converted/` (GIFs),
+`cuts/` (silence removal), `exports/`, `previews/`, `models/`.
+
+## Transcripts
+
+- Engines: `faster-whisper` (set `python` to an interpreter with
+  `faster-whisper` installed; more accurate, per-word confidence) or ffmpeg's
+  built-in `whisper.cpp` filter (no extra installs). `auto` picks
+  faster-whisper when available. Models download into `<work>/models` on first
+  use.
+- Names are deterministic: `<name>.vtt` + `<name>.words.json` next to the
+  video, or `<name>.<fingerprint>.vtt` in `<work>/transcripts`. The fingerprint
+  hashes size + first/last MiB, so renamed or copied files reuse the
+  transcript. Lookup order: next to the video, then the work folder.
+- `find_words` uses word timings when available and falls back to cue times for
+  a hand-made `.vtt`.
+
+## Media server
+
+`node agent/serve.mjs [--port 8787]` runs it standalone; the MCP server starts
+it in-process when nothing is listening on the configured port. Both read the
+same registry (`<work>/published.json`), so either can serve what the other
+published.
+
+| Endpoint | |
+|---|---|
+| `/` | Gallery of published results, live-updating |
+| `/api/artifacts` | JSON list with URLs |
+| `/api/status` | Work folder, current project id, editor URL |
+| `/events` | Server-sent events: fires whenever the registry changes |
+| `/a/<id>/<file>` | The file, with byte ranges (seekable video) |
+| `/editor` | Redirects to the OpenCut editor for the current project |
+
+CORS is open so another local UI can embed or fetch anything.
 
 ## Known limits
 
@@ -57,5 +101,8 @@ in dB (0 = original, -60..20).
 ## Development
 
 - `node test/make-media.mjs` generates synthetic test media into `out/media`
+- `node test/make-speech.mjs` generates a spoken clip (Windows speech synthesis)
 - `node test/mcp-e2e.mjs` runs a full edit through the MCP server
+- `node test/transcript-e2e.mjs` checks transcription, word search and the
+  media server (uses a throwaway settings file)
 - `node smoke-test.mjs` exercises the Playwright client directly
