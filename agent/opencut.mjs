@@ -5,8 +5,10 @@ import { chromium } from "playwright-core";
 import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 
+const AGENT_DIR = dirname(fileURLToPath(import.meta.url));
 const FILE_INPUT_SELECTOR = "#__opencut-agent-file-input";
 
 const BROWSER_CANDIDATES = [
@@ -31,7 +33,7 @@ export async function launch({
 	baseUrl = "http://localhost:3000",
 	projectId,
 	headless = true,
-	userDataDir = resolve("out/browser-profile"),
+	userDataDir = resolve(AGENT_DIR, "out/browser-profile"),
 	timeoutMs = 180_000,
 } = {}) {
 	// A persistent profile keeps projects and media (IndexedDB/OPFS) between runs.
@@ -51,12 +53,15 @@ export async function launch({
 	page.on("pageerror", (error) => logs.push(`[pageerror] ${error.message}`));
 
 	// An unknown project id makes the editor create a new project and redirect.
-	await page.goto(`${baseUrl}/editor/${projectId ?? randomUUID()}`, {
-		timeout: timeoutMs,
-	});
-	await page.waitForFunction(() => window.__opencutAgent?.isReady(), null, {
-		timeout: timeoutMs,
-	});
+	const openProject = async (id) => {
+		await page.goto(`${baseUrl}/editor/${id ?? randomUUID()}`, {
+			timeout: timeoutMs,
+		});
+		await page.waitForFunction(() => window.__opencutAgent?.isReady(), null, {
+			timeout: timeoutMs,
+		});
+	};
+	await openProject(projectId);
 
 	const call = (method, args) =>
 		page.evaluate(
@@ -68,6 +73,7 @@ export async function launch({
 		page,
 		logs,
 		call,
+		openProject,
 		getState: () => call("getState"),
 		getElement: (args) => call("getElement", args),
 		addMedia: (args) => call("addMedia", args),
@@ -81,6 +87,10 @@ export async function launch({
 		setKeyframes: (args) => call("setKeyframes", args),
 		removeTrack: (args) => call("removeTrack", args),
 		reorderTrack: (args) => call("reorderTrack", args),
+		renderFrame: (args) => call("renderFrame", args),
+		listProjects: () => call("listProjects"),
+		renameProject: (args) => call("renameProject", args),
+		updateSettings: (args) => call("updateSettings", args),
 		undo: () => call("undo"),
 		redo: () => call("redo"),
 		save: () => call("save"),
