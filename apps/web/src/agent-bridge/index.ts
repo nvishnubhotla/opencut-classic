@@ -6,6 +6,7 @@ import {
 	TracksSnapshotCommand,
 } from "@/commands/timeline";
 import { processMediaAssets } from "@/media/processing";
+import { CanvasRenderer } from "@/services/renderer/canvas-renderer";
 import type { MediaAsset } from "@/media/types";
 import {
 	buildElementFromMedia,
@@ -176,6 +177,43 @@ const agent = {
 				elements: track.elements.map(describeElement),
 			})),
 		};
+	},
+
+	async listProjects() {
+		await editor().project.loadAllProjects();
+		return editor()
+			.project.getSavedProjects()
+			.map((project) => ({
+				id: project.id,
+				name: project.name,
+				duration: secs(project.duration),
+				updatedAt: project.updatedAt,
+			}));
+	},
+
+	async renameProject({ name }: { name: string }) {
+		const id = editor().project.getActive().metadata.id;
+		await editor().project.renameProject({ id, name });
+	},
+
+	/** Changes canvas size (e.g. 1080x1920 for vertical) and/or frame rate. */
+	async updateSettings({
+		width,
+		height,
+		fps,
+	}: {
+		width?: number;
+		height?: number;
+		fps?: number;
+	}) {
+		const current = editor().project.getActive().settings;
+		await editor().project.updateSettings({
+			settings: {
+				...(width && height ? { canvasSize: { width, height } } : {}),
+				...(fps ? { fps: { numerator: fps, denominator: 1 } } : {}),
+			},
+		});
+		return { before: current, after: editor().project.getActive().settings };
 	},
 
 	getElement({ elementId }: { elementId: string }) {
@@ -481,6 +519,49 @@ const agent = {
 			chunkBytes: EXPORT_CHUNK_BYTES,
 			chunks: Math.ceil(lastExport.byteLength / EXPORT_CHUNK_BYTES),
 		};
+	},
+
+	/**
+	 * Renders the timeline at `time` and returns a base64 JPEG, downscaled to
+	 * `width`. Lets callers check a frame without exporting the whole video.
+	 */
+	async renderFrame({ time, width = 960 }: { time: number; width?: number }) {
+		const renderTree = editor().renderer.getRenderTree();
+		if (!renderTree) {
+			throw new Error("Nothing to render yet");
+		}
+		const { canvasSize, fps } = editor().project.getActive().settings;
+		const renderTime = Math.min(
+			ticks(time),
+			editor().timeline.getLastFrameTime(),
+		) as MediaTime;
+		// The video cache drops superseded requests per media and returns its
+		// current frame, so the live preview rendering a different playhead time
+		// would hand us a stale frame. Park the playhead on our time first.
+		editor().playback.seek({ time: renderTime });
+		await new Promise((resolve) => setTimeout(resolve, 150));
+
+		const renderer = new CanvasRenderer({
+			width: canvasSize.width,
+			height: canvasSize.height,
+			fps,
+		});
+		const fullCanvas = document.createElement("canvas");
+		fullCanvas.width = canvasSize.width;
+		fullCanvas.height = canvasSize.height;
+		await renderer.renderToCanvas({
+			node: renderTree,
+			time: renderTime,
+			targetCanvas: fullCanvas,
+		});
+
+		const scaled = document.createElement("canvas");
+		scaled.width = Math.min(width, canvasSize.width);
+		scaled.height = Math.round(
+			(scaled.width * canvasSize.height) / canvasSize.width,
+		);
+		scaled.getContext("2d")?.drawImage(fullCanvas, 0, 0, scaled.width, scaled.height);
+		return scaled.toDataURL("image/jpeg", 0.85).split(",")[1];
 	},
 
 	getExportProgress(): number {
