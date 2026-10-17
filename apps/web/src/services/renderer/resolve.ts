@@ -224,6 +224,8 @@ async function resolveVideoNode({
 	return {
 		...visualState,
 		source: frame.canvas,
+		// The video cache reuses a small pool of canvases across frames.
+		sourceVersion: frame.timestamp,
 		sourceWidth: frame.canvas.width,
 		sourceHeight: frame.canvas.height,
 	};

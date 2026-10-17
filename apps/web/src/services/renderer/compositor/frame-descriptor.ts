@@ -244,6 +244,10 @@ async function collectVisualSourceNode({
 		kind: "external",
 		id: textureId,
 		source,
+		sourceVersion:
+			node instanceof GraphicNode
+				? undefined
+				: (node.resolved as ResolvedVisualSourceNodeState).sourceVersion,
 		width: sourceWidth,
 		height: sourceHeight,
 	});

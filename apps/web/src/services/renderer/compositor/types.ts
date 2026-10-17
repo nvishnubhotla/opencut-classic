@@ -54,6 +54,11 @@ export type ExternalTextureDescriptor = {
 	kind: "external";
 	id: string;
 	source: CanvasImageSource;
+	/**
+	 * Changes when a reused source (e.g. a pooled video canvas) holds new
+	 * pixels. Source identity alone misses that after a seek.
+	 */
+	sourceVersion?: number;
 	width: number;
 	height: number;
 };
