@@ -56,13 +56,14 @@ function sibling(path, suffix, extension) {
  * video first. WebM/VP9 keeps an alpha channel; whether it survives depends on
  * the browser's decoder.
  */
-export async function convertGif(input, { keepAlpha = true, minDuration } = {}) {
+export async function convertGif(input, { keepAlpha = true, minDuration, outputDir } = {}) {
 	// Loop the GIF enough times to cover minDuration, since clips longer than
 	// their source freeze on the last frame.
 	const { duration } = await probe(input);
 	const loops =
 		minDuration && duration > 0 ? Math.max(0, Math.ceil(minDuration / duration) - 1) : 0;
-	const output = sibling(input, loops ? `.gif.x${loops + 1}` : ".gif", keepAlpha ? ".webm" : ".mp4");
+	const besideInput = sibling(input, loops ? `.gif.x${loops + 1}` : ".gif", keepAlpha ? ".webm" : ".mp4");
+	const output = outputDir ? join(outputDir, basename(besideInput)) : besideInput;
 	const args = keepAlpha
 		? ["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-b:v", "0", "-crf", "30", "-auto-alt-ref", "0"]
 		: ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"];
