@@ -23,6 +23,8 @@ const webEnvSchema = z.object({
 	MARBLE_WORKSPACE_KEY: z.string(),
 	FREESOUND_CLIENT_ID: z.string(),
 	FREESOUND_API_KEY: z.string(),
+	// Optional: enables the GIPHY tab in the media panel.
+	GIPHY_API_KEY: z.string().optional(),
 });
 
 export type WebEnv = z.infer<typeof webEnvSchema>;
