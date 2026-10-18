@@ -177,7 +177,13 @@ export class ProjectManager {
 				}
 			}
 		} catch (error) {
-			console.error("Failed to load project:", error);
+			// An unknown id is expected (callers create a project instead), so
+			// don't log it as an error.
+			const isNotFound =
+				error instanceof Error && error.message.endsWith("not found");
+			if (!isNotFound) {
+				console.error("Failed to load project:", error);
+			}
 			throw error;
 		} finally {
 			this.isLoading = false;
