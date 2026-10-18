@@ -92,6 +92,31 @@ published.
 
 CORS is open so another local UI can embed or fetch anything.
 
+## Driving an editor in your own app (remote control)
+
+Load `http://localhost:8787/editor` in a panel (iframe, webview, any browser).
+It redirects to the editor with `?control=…&token=…`; the page then connects
+back to the media server and takes commands from it. While a panel is
+connected, every editing tool drives that panel, so you watch edits happen and
+can take over by hand. Nothing in your app is exposed; only the editor page
+connects out.
+
+- `editor_target` setting: `auto` (panel if connected, else headless),
+  `panel` (fail without one) or `headless`.
+- Files are imported by the page downloading them from the media server.
+- The panel's browser keeps its own projects, separate from the headless one.
+- The relay is token-protected (`<work>/control-token`). Any backend can use
+  it, not just the MCP server:
+
+| Endpoint | |
+|---|---|
+| `POST /control/call?token=` `{method, args}` | Run a bridge method (`getState`, `addText`, `trim`, …). Answers `{done, ok, result}` or, after ~25 s, `{done: false, id}` |
+| `GET /control/wait?token=&id=` | Keep waiting for a long call (exports) |
+| `GET /control/editors?token=` | Connected editors |
+
+Methods and arguments are in `apps/web/src/agent-bridge/index.ts` (seconds
+everywhere). The bridge exists only when the web app runs in development mode.
+
 ## Known limits
 
 - GIF transparency is lost (the browser's video decoder drops alpha); use
@@ -105,6 +130,8 @@ CORS is open so another local UI can embed or fetch anything.
 - `node test/make-media.mjs` generates synthetic test media into `out/media`
 - `node test/make-speech.mjs` generates a spoken clip (Windows speech synthesis)
 - `node test/mcp-e2e.mjs` runs a full edit through the MCP server
+- `node test/panel-e2e.mjs` drives an editor opened in a separate browser
+  through the remote-control relay
 - `node test/transcript-e2e.mjs` checks transcription, word search and the
   media server (uses a throwaway settings file)
 - `node smoke-test.mjs` exercises the Playwright client directly

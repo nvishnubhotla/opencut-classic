@@ -26,6 +26,9 @@ const DEFAULTS = {
 	language: "en",
 	// Port for the media server; 0 disables auto-start.
 	server_port: 8787,
+	// Which editor tools drive: "auto" (a connected panel if any, else a
+	// headless browser), "panel" (only a connected panel) or "headless".
+	editor_target: "auto",
 };
 
 export const SETTING_DESCRIPTIONS = {
@@ -37,6 +40,8 @@ export const SETTING_DESCRIPTIONS = {
 	keep_fillers: "Keep um/uh/like in transcripts (faster-whisper only)",
 	language: 'Spoken language code (e.g. "en") or "auto"',
 	server_port: "Media server port; 0 = don't start it automatically",
+	editor_target:
+		'"auto" (a connected editor panel if any, else headless), "panel" or "headless"',
 };
 
 export function configPath() {
@@ -67,6 +72,9 @@ export function saveConfig(patch) {
 	}
 	if (!["auto", "faster-whisper", "whisper.cpp"].includes(next.transcription_engine)) {
 		throw new Error('transcription_engine must be "auto", "faster-whisper" or "whisper.cpp"');
+	}
+	if (!["auto", "panel", "headless"].includes(next.editor_target)) {
+		throw new Error('editor_target must be "auto", "panel" or "headless"');
 	}
 	mkdirSync(dirname(CONFIG_PATH), { recursive: true });
 	writeFileSync(CONFIG_PATH, `${JSON.stringify(next, null, 2)}\n`);

@@ -143,6 +143,26 @@ function trackTypeForMedia(asset: MediaAsset): TrackType {
 	return asset.type === "audio" ? "audio" : "video";
 }
 
+async function importFileList(files: File[]) {
+	const projectId = editor().project.getActive().metadata.id;
+	const processed = await processMediaAssets({ files });
+	const imported = [];
+	for (const asset of processed) {
+		const saved = await editor().media.addMediaAsset({ projectId, asset });
+		if (saved) {
+			imported.push({
+				id: saved.id,
+				name: saved.name,
+				type: saved.type,
+				duration: saved.duration,
+				width: saved.width,
+				height: saved.height,
+			});
+		}
+	}
+	return imported;
+}
+
 const agent = {
 	isReady(): boolean {
 		return editor().project.getActiveOrNull() !== null;
@@ -235,26 +255,34 @@ const agent = {
 			throw new Error("No files selected in the agent file input");
 		}
 
-		const projectId = editor().project.getActive().metadata.id;
-		const processed = await processMediaAssets({ files });
-		const imported = [];
-		for (const asset of processed) {
-			const saved = await editor().media.addMediaAsset({ projectId, asset });
-			if (saved) {
-				imported.push({
-					id: saved.id,
-					name: saved.name,
-					type: saved.type,
-					duration: saved.duration,
-					width: saved.width,
-					height: saved.height,
-				});
-			}
-		}
+		const imported = await importFileList(files);
 		if (input) {
 			input.value = "";
 		}
 		return imported;
+	},
+
+	/** Downloads files (e.g. from the control relay) and imports them. */
+	async importUrls({ files }: { files: Array<{ url: string; name: string }> }) {
+		const downloaded = await Promise.all(
+			files.map(async ({ url, name }) => {
+				const response = await fetch(url);
+				if (!response.ok) {
+					throw new Error(`Download failed (${response.status}): ${name}`);
+				}
+				const blob = await response.blob();
+				return new File([blob], name, {
+					type: blob.type,
+					lastModified: Date.now(),
+				});
+			}),
+		);
+		return importFileList(downloaded);
+	},
+
+	/** Opens another project; replies before the page reloads. */
+	navigate({ projectId }: { projectId: string }) {
+		setTimeout(() => window.location.assign(`/editor/${projectId}`), 50);
 	},
 
 	addMedia({
@@ -607,4 +635,94 @@ export function installAgentBridge(): void {
 
 	(window as Window & { __opencutAgent?: OpenCutAgent }).__opencutAgent =
 		agent;
+	connectControl();
+}
+
+// ------------------------------------------------------------ remote control
+
+const CONTROL_STORAGE_KEY = "opencut-agent-control";
+
+type ControlTarget = { server: string; token: string };
+
+/**
+ * Relay to take commands from, given as ?control=<url>&token=<secret> on the
+ * editor URL. Kept for the tab's lifetime so project switches stay connected.
+ */
+function controlTarget(): ControlTarget | null {
+	const params = new URLSearchParams(window.location.search);
+	const server = params.get("control");
+	const token = params.get("token");
+	try {
+		if (server && token) {
+			sessionStorage.setItem(
+				CONTROL_STORAGE_KEY,
+				JSON.stringify({ server, token }),
+			);
+			return { server, token };
+		}
+		const stored = sessionStorage.getItem(CONTROL_STORAGE_KEY);
+		return stored ? (JSON.parse(stored) as ControlTarget) : null;
+	} catch {
+		return server && token ? { server, token } : null;
+	}
+}
+
+// Read the URL as soon as the module loads: opening an unknown project id
+// creates a project and replaces the URL, dropping the query string.
+if (typeof window !== "undefined") {
+	controlTarget();
+}
+
+let controlSource: EventSource | null = null;
+
+/** Subscribes to the relay and runs each command it sends on `agent`. */
+function connectControl(): void {
+	const target = controlTarget();
+	if (!target) {
+		return;
+	}
+	controlSource?.close();
+
+	const relayUrl = (route: string) => {
+		const url = new URL(`/control/${route}`, target.server);
+		url.searchParams.set("token", target.token);
+		return url;
+	};
+	const streamUrl = relayUrl("editor");
+	streamUrl.searchParams.set(
+		"project",
+		editor().project.getActive().metadata.id,
+	);
+
+	const source = new EventSource(streamUrl);
+	controlSource = source;
+	source.onmessage = async (event) => {
+		const { id, method, args } = JSON.parse(event.data) as {
+			id: string;
+			method: string;
+			args?: unknown;
+		};
+		let reply: { id: string; ok: boolean; result?: unknown; error?: string };
+		try {
+			if (!Object.hasOwn(agent, method)) {
+				throw new Error(`Unknown method: ${method}`);
+			}
+			const run = agent[method as keyof OpenCutAgent] as (
+				params?: unknown,
+			) => unknown;
+			reply = { id, ok: true, result: await run(args) };
+		} catch (error) {
+			reply = {
+				id,
+				ok: false,
+				error: error instanceof Error ? error.message : String(error),
+			};
+		}
+		// text/plain keeps this a simple request (no CORS preflight).
+		await fetch(relayUrl("result"), {
+			method: "POST",
+			headers: { "Content-Type": "text/plain" },
+			body: JSON.stringify(reply),
+		});
+	};
 }

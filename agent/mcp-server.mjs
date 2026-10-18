@@ -33,6 +33,7 @@ import {
 	writeSession,
 } from "./artifacts.mjs";
 import { isServing, startServer } from "./serve.mjs";
+import { connectedEditors, connectRemote } from "./remote-editor.mjs";
 
 const AGENT_DIR = dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = resolve(AGENT_DIR, "../apps/web");
@@ -113,17 +114,40 @@ function publish(path, options) {
 let session = null;
 let sessionHeaded = false;
 
+const sessionMode = () => (!session ? null : session.remote ? "panel" : sessionHeaded ? "headed" : "headless");
+
 async function recordSession(editor) {
 	const state = await editor.getState();
-	writeSession({ project_id: state.projectId, headed: sessionHeaded, editor_base: BASE_URL });
+	writeSession({ project_id: state.projectId, mode: sessionMode(), editor_base: BASE_URL });
 	return state;
 }
 
+/** Media server URL when tools should drive a connected editor panel. */
+async function panelServer() {
+	const target = loadConfig().editor_target;
+	if (target === "headless") return null;
+	const url = await ensureMediaServer().catch(() => null);
+	if (url && (await connectedEditors(url)).length > 0) return url;
+	if (target === "panel") {
+		throw new Error(
+			`No editor panel is connected. Load ${url ?? "<media server>"}/editor in your app's panel, or set editor_target to "auto".`,
+		);
+	}
+	return null;
+}
+
 async function getSession({ headed, projectId } = {}) {
-	if (session && headed !== undefined && headed !== sessionHeaded) {
+	const panel = await panelServer();
+	if (session && Boolean(session.remote) !== Boolean(panel)) {
 		await closeSession();
 	}
-	if (!session) {
+	if (session && !session.remote && headed !== undefined && headed !== sessionHeaded) {
+		await closeSession();
+	}
+	if (!session && panel) {
+		session = connectRemote({ serverUrl: panel });
+		if (projectId) await session.openProject(projectId);
+	} else if (!session) {
 		await ensureDevServer();
 		sessionHeaded = headed ?? false;
 		session = await launch({
@@ -131,7 +155,7 @@ async function getSession({ headed, projectId } = {}) {
 			projectId,
 			headless: !sessionHeaded,
 		});
-		session.page.on("close", () => (session = null));
+		session.onClose(() => (session = null));
 	} else if (projectId) {
 		await session.save().catch(() => {});
 		await session.openProject(projectId);
@@ -315,7 +339,7 @@ const tools = [
 	{
 		name: "open_project",
 		description:
-			"Start the editor and open a project. Without project_id it keeps the current project, or creates a new one on first use (use new_project to start another). Starts the dev server and browser if needed. headed=true opens a visible editor window you can watch and edit by hand.",
+			"Start the editor and open a project. Without project_id it keeps the current project, or creates a new one on first use (use new_project to start another). If an editor panel is connected (another app loaded the media server's /editor URL), all tools drive that panel; otherwise a browser is started (headless unless headed=true, which opens a visible window). Note: a panel and the headless browser keep separate project lists.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -331,7 +355,8 @@ const tools = [
 			const server = await ensureMediaServer().catch(() => null);
 			return text({
 				project_id: state.projectId,
-				editor_url: `${BASE_URL}/editor/${state.projectId}`,
+				editor: sessionMode(),
+				panel_url: server ? `${server}/editor` : null,
 				media_server: server,
 				canvas: state.canvasSize,
 				fps: state.fps,
@@ -1064,10 +1089,16 @@ const tools = [
 				language: str(SETTING_DESCRIPTIONS.language),
 				keep_fillers: bool(SETTING_DESCRIPTIONS.keep_fillers),
 				server_port: num(SETTING_DESCRIPTIONS.server_port),
+				editor_target: {
+					type: "string",
+					enum: ["auto", "panel", "headless"],
+					description: SETTING_DESCRIPTIONS.editor_target,
+				},
 			},
 		},
 		async handler(args) {
 			const settings = saveConfig(args);
+			if (args.editor_target !== undefined) await closeSession();
 			if (args.server_port !== undefined) await ensureMediaServer(settings.server_port);
 			return text({ settings, stored_at: configPath() });
 		},
@@ -1172,6 +1203,8 @@ const tools = [
 				status_api: `${url}/api/status`,
 				events_sse: `${url}/events`,
 				editor: `${url}/editor`,
+				editor_note: "Load the editor URL in a panel and the agent's editing tools will drive that panel.",
+				connected_editors: await connectedEditors(url),
 				published: listArtifacts().length,
 				running_in: mediaServer?.url === url ? "this MCP server" : "another process",
 			});

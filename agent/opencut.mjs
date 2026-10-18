@@ -70,10 +70,29 @@ export async function launch({
 		);
 
 	return {
+		...bridgeApi(call),
 		page,
 		logs,
-		call,
 		openProject,
+
+		/** Imports local files into the project's media library. */
+		async importFiles(paths) {
+			await page.setInputFiles(
+				FILE_INPUT_SELECTOR,
+				paths.map((path) => resolve(path)),
+			);
+			return call("importFiles");
+		},
+
+		onClose: (listener) => page.on("close", listener),
+		close: () => context.close(),
+	};
+}
+
+/** Bridge methods over any transport; `call(method, args)` runs one in the page. */
+export function bridgeApi(call) {
+	return {
+		call,
 		getState: () => call("getState"),
 		getElement: (args) => call("getElement", args),
 		addMedia: (args) => call("addMedia", args),
@@ -95,15 +114,6 @@ export async function launch({
 		redo: () => call("redo"),
 		save: () => call("save"),
 
-		/** Imports local files into the project's media library. */
-		async importFiles(paths) {
-			await page.setInputFiles(
-				FILE_INPUT_SELECTOR,
-				paths.map((path) => resolve(path)),
-			);
-			return call("importFiles");
-		},
-
 		/** Renders the project and writes it to `outPath`. */
 		async exportTo(outPath, options = {}) {
 			const info = await call("export", options);
@@ -117,7 +127,5 @@ export async function launch({
 			await writeFile(outPath, bytes);
 			return { path: resolve(outPath), bytes: bytes.length };
 		},
-
-		close: () => context.close(),
 	};
 }

@@ -4,11 +4,13 @@
 // Standalone:  node agent/serve.mjs [--port 8787]
 // The MCP server starts it in-process when nothing is listening on the port.
 import { createReadStream, existsSync, statSync, watch, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { basename, extname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { artifactUrl, listArtifacts, readSession, registryPath } from "./artifacts.mjs";
 import { loadConfig } from "./config.mjs";
+import { createControlRelay, panelEditorUrl } from "./control.mjs";
 
 const MIME = {
 	".mp4": "video/mp4",
@@ -33,7 +35,7 @@ const MIME = {
 const CORS = {
 	"Access-Control-Allow-Origin": "*",
 	"Access-Control-Allow-Headers": "*",
-	"Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+	"Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
 };
 
 function sendJson(res, status, body) {
@@ -134,13 +136,20 @@ export function startServer({ port = loadConfig().server_port } = {}) {
 		debounce = setTimeout(broadcast, 100);
 	});
 
-	const server = createServer((req, res) => {
+	const relay = createControlRelay({ cors: CORS, sendJson, sendFile });
+
+	const server = createServer(async (req, res) => {
 		const url = new URL(req.url, `http://localhost:${port}`);
 		const path = decodeURIComponent(url.pathname);
 		if (req.method === "OPTIONS") {
 			res.writeHead(204, CORS);
 			return res.end();
 		}
+		const handled = await relay.handle(req, res, url).catch((error) => {
+			sendJson(res, 500, { error: error.message });
+			return true;
+		});
+		if (handled) return;
 		if (path === "/" || path === "/index.html") {
 			res.writeHead(200, { ...CORS, "Content-Type": "text/html; charset=utf-8" });
 			return res.end(GALLERY);
@@ -173,8 +182,13 @@ export function startServer({ port = loadConfig().server_port } = {}) {
 		}
 		if (path === "/editor" || path.startsWith("/editor/")) {
 			const editorBase = process.env.OPENCUT_URL ?? "http://localhost:3000";
-			const id = path.split("/")[2] || readSession()?.project_id;
-			res.writeHead(302, { ...CORS, Location: id ? `${editorBase}/editor/${id}` : `${editorBase}/projects` });
+			// Editors opened from here connect back to the relay, so a panel that
+			// loads /editor can be driven by the agent.
+			const id = path.split("/")[2] || readSession()?.project_id || randomUUID();
+			res.writeHead(302, {
+				...CORS,
+				Location: panelEditorUrl({ editorBase, serverUrl: `http://localhost:${port}`, projectId: id }),
+			});
 			return res.end();
 		}
 		const match = path.match(/^\/a\/([^/]+)(?:\/|$)/);
@@ -188,6 +202,9 @@ export function startServer({ port = loadConfig().server_port } = {}) {
 		sendJson(res, 404, { error: "Not found" });
 	});
 
+	// Relay calls are long-polls and editor streams stay open indefinitely.
+	server.requestTimeout = 0;
+
 	return new Promise((ok, fail) => {
 		server.once("error", (error) => {
 			watcher.close();
@@ -198,8 +215,10 @@ export function startServer({ port = loadConfig().server_port } = {}) {
 				port,
 				url: `http://localhost:${port}`,
 				broadcast,
+				editors: relay.listEditors,
 				close: () => {
 					watcher.close();
+					relay.close();
 					for (const res of clients) res.end();
 					server.close();
 				},
