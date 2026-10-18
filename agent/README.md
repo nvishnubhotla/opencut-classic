@@ -65,6 +65,8 @@ folder (default `~/opencut-work`): `transcripts/`, `converted/` (GIFs),
   built-in `whisper.cpp` filter (no extra installs). `auto` picks
   faster-whisper when available. Models download into `<work>/models` on first
   use.
+- `node setup-whisper.mjs [--model small.en] [--python <base python>]` creates
+  `agent/.venv` with faster-whisper and points the settings at it.
 - Names are deterministic: `<name>.vtt` + `<name>.words.json` next to the
   video, or `<name>.<fingerprint>.vtt` in `<work>/transcripts`. The fingerprint
   hashes size + first/last MiB, so renamed or copied files reuse the

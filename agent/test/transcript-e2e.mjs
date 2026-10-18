@@ -2,6 +2,7 @@
 // Uses a throwaway settings file so the user's settings are untouched.
 import { copyFileSync, existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
+import { loadConfig } from "../config.mjs";
 import { agentDir, connect } from "./mcp-client.mjs";
 
 const media = resolve(agentDir, "out/media");
@@ -18,11 +19,14 @@ const check = (condition, label) => {
 const mcp = await connect({ env: { OPENCUT_AGENT_CONFIG: configFile } });
 try {
 	const { settings } = await mcp.tool("get_settings");
-	await mcp.tool("set_settings", { transcript_location: "work_folder", server_port: 8799 });
+	// Reuse the real python setting so faster-whisper is exercised when installed.
+	const { python } = loadConfig();
+	await mcp.tool("set_settings", { transcript_location: "work_folder", server_port: 8799, python });
 
 	const first = await mcp.tool("transcribe_video", { path: speech, force: true });
 	check(existsSync(first.vtt) && existsSync(first.words), "vtt + words.json written");
 	check(first.vtt.startsWith(settings.work_folder), "written in the work folder");
+	if (python) check(first.engine === "faster-whisper", "faster-whisper engine used");
 
 	const second = await mcp.tool("transcribe_video", { path: speech });
 	check(second.reused === true && second.vtt === first.vtt, "second call reuses transcript");

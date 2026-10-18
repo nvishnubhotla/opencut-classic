@@ -284,6 +284,7 @@ export async function transcribe(videoPath, { force = false, location, model, la
 			: { location: "workFolder", ...paths.workFolder };
 
 	const engine = await resolveEngine();
+	const modelName = model ?? loadConfig().whisper_model;
 	const started = Date.now();
 	const words =
 		engine === "faster-whisper"
@@ -295,7 +296,7 @@ export async function transcribe(videoPath, { force = false, location, model, la
 		JSON.stringify({
 			source: absolute,
 			engine,
-			model: model ?? loadConfig().whisper_model,
+			model: modelName,
 			created: new Date().toISOString(),
 			words,
 		}),
@@ -307,6 +308,7 @@ export async function transcribe(videoPath, { force = false, location, model, la
 		words: target.words,
 		reused: false,
 		engine,
+		model: modelName,
 		seconds: +((Date.now() - started) / 1000).toFixed(1),
 		word_count: words.length,
 		cue_count: cues.length,
