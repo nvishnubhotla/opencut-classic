@@ -207,30 +207,57 @@ export async function cutSilences(
 	return summary;
 }
 
-/** Tiles evenly spaced frames into one PNG; returns base64. */
-export async function contactSheet(input, { frames = 12, columns = 4, width = 480 } = {}) {
+// Claude Code drops a stdio MCP server whose single message exceeds 16 MB, and the
+// Claude API rejects images over 5 MB, so a sheet must stay well under both.
+const SHEET_MAX_BYTES = 3.5 * 1024 * 1024;
+
+/**
+ * Tiles evenly spaced frames into one JPEG; returns base64. Tile width and
+ * quality step down until the image fits SHEET_MAX_BYTES, so large sources
+ * (e.g. 10-bit iPhone HEVC, portrait) cannot produce an oversized response.
+ */
+export async function contactSheet(input, { frames = 12, columns, width } = {}) {
 	const { duration, hasVideo } = await probe(input);
 	if (!hasVideo) throw new Error("No video stream");
-	const count = Math.max(1, Math.min(frames, 36));
-	const rows = Math.ceil(count / columns);
-	const output = join(tmpdir(), `opencut-sheet-${randomUUID()}.png`);
+	if (!(duration > 0)) throw new Error("Could not read the video duration");
+	const count = Math.max(1, Math.min(Math.round(frames) || 12, 36));
+	const cols = Math.max(1, Math.min(columns ?? Math.ceil(Math.sqrt(count)), count));
+	const rows = Math.ceil(count / cols);
+	let tileWidth = width ?? Math.min(480, Math.floor(1920 / cols));
+	let quality = 4; // mjpeg -q:v, 2 (best) .. 31 (worst)
+	const output = join(tmpdir(), `opencut-sheet-${randomUUID()}.jpg`);
 	try {
-		await run("ffmpeg", [
-			"-v",
-			"error",
-			"-y",
-			"-i",
-			input,
-			"-vf",
-			`fps=${count / duration},scale=${width}:-2,tile=${columns}x${rows}:padding=4:color=red`,
-			"-frames:v",
-			"1",
-			output,
-		]);
-		const times = Array.from({ length: count }, (_, i) =>
-			+((i * duration) / count).toFixed(2),
-		);
-		return { png: (await readFile(output)).toString("base64"), times, duration };
+		for (let attempt = 0; ; attempt++) {
+			await run("ffmpeg", [
+				"-nostdin",
+				"-v",
+				"error",
+				"-y",
+				"-i",
+				input,
+				"-vf",
+				`fps=${count / duration},scale=${tileWidth}:-2,format=yuvj420p,tile=${cols}x${rows}:padding=4:color=red`,
+				"-frames:v",
+				"1",
+				"-q:v",
+				String(quality),
+				output,
+			]);
+			const image = await readFile(output);
+			if (image.length <= SHEET_MAX_BYTES) {
+				const times = Array.from({ length: count }, (_, i) =>
+					+((i * duration) / count).toFixed(2),
+				);
+				return { data: image.toString("base64"), mimeType: "image/jpeg", times, duration };
+			}
+			if (attempt >= 3) {
+				throw new Error(
+					`Contact sheet is still ${(image.length / 1048576).toFixed(1)} MB after shrinking; request fewer frames`,
+				);
+			}
+			tileWidth = Math.max(64, Math.floor((tileWidth * 0.7) / 2) * 2);
+			quality = Math.min(quality + 4, 20);
+		}
 	} finally {
 		await rm(output, { force: true });
 	}

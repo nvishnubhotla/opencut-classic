@@ -994,7 +994,7 @@ const tools = [
 			if (contact_sheet) {
 				const sheet = await contactSheet(result.path);
 				content.push({ type: "text", text: `frames at ${sheet.times.join(", ")}s` });
-				content.push({ type: "image", mimeType: "image/png", data: sheet.png });
+				content.push({ type: "image", mimeType: sheet.mimeType, data: sheet.data });
 			}
 			return { content };
 		},
@@ -1047,7 +1047,7 @@ const tools = [
 			return {
 				content: [
 					{ type: "text", text: `duration ${sheet.duration}s; frames at ${sheet.times.join(", ")}s` },
-					{ type: "image", mimeType: "image/png", data: sheet.png },
+					{ type: "image", mimeType: sheet.mimeType, data: sheet.data },
 				],
 			};
 		},
@@ -1271,8 +1271,31 @@ Results: export_video, cut_silences and transcribe_video publish their output on
 
 // ----------------------------------------------------------------- transport
 
+// Claude Code disconnects a stdio server whose single message exceeds 16 MB,
+// which takes every tool down. Replace any oversized message with an error.
+const MAX_MESSAGE_BYTES = 15 * 1024 * 1024;
+
 function send(message) {
-	process.stdout.write(`${JSON.stringify(message)}\n`);
+	let line = JSON.stringify(message);
+	const bytes = Buffer.byteLength(line);
+	if (bytes > MAX_MESSAGE_BYTES) {
+		log(`dropping oversized response (${bytes} bytes) for id ${message.id}`);
+		if (message.id === undefined) return;
+		line = JSON.stringify({
+			jsonrpc: "2.0",
+			id: message.id,
+			result: {
+				isError: true,
+				content: [
+					{
+						type: "text",
+						text: `Response too large to send (${(bytes / 1048576).toFixed(1)} MB; limit ${MAX_MESSAGE_BYTES / 1048576} MB). Ask for less output (e.g. fewer frames).`,
+					},
+				],
+			},
+		});
+	}
+	process.stdout.write(`${line}\n`);
 }
 
 async function handle(request) {
@@ -1359,5 +1382,8 @@ async function shutdown() {
 	process.exit(0);
 }
 process.stdin.on("end", shutdown);
+// A bug in one tool must never take the whole server (and every tool) down.
+process.on("uncaughtException", (error) => log("uncaught exception:", error));
+process.on("unhandledRejection", (error) => log("unhandled rejection:", error));
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
